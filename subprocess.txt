@@ -24,9 +24,11 @@ was compiled with (in particular, `FILE*` pointers should be
 compatible). If you are not sure, don't use SHARE_LIOLIB, because it can
 cause crashing!
 
+* SHARE_LIOLIB doesn't work in MSVC.
+
 .Example
 --------------------------
-gcc -fPIC -shared -DOS_POSIX -DLIOLIB_SHARE -o subprocess.so \
+gcc -fPIC -shared -DOS_POSIX -DSHARE_LIOLIB -o subprocess.so \
     subprocess.c liolib-copy.c -llua
 --------------------------
 
