@@ -30,12 +30,12 @@
 #include "stdlib.h"
 #include "stdio.h"
 #include "string.h"
-#include "unistd.h"
-#include "fcntl.h"
 #include "errno.h"
+#include "fcntl.h"
 #include "assert.h"
 #include "liolib-copy.h"
 #if defined(OS_POSIX)
+#include "unistd.h"
 #include "sys/wait.h"
 #include "sys/stat.h"
 typedef int filedes_t;
@@ -52,6 +52,12 @@ static int direxists(const char *fname)
 
 #elif defined(OS_WINDOWS)
 #include "windows.h"
+
+/* Some SDKs don't define this */
+#ifndef INVALID_FILE_ATTRIBUTES
+#define INVALID_FILE_ATTRIBUTES ((DWORD) -1)
+#endif
+
 typedef HANDLE filedes_t;
 
 /* return 1 if the named directory exists and is a directory */
@@ -63,6 +69,14 @@ static int direxists(const char *fname)
     return !!(result & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+#endif /* defined(OS_WINDOWS) */
+
+/* Some systems don't define these, but we use them as indices for our arrays.
+   I probably oughtn't, in case a system doesn't use 0, 1 and 2 for these. */
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#define STDOUT_FILENO 1
+#define STDERR_FILENO 2
 #endif
 
 /* This is the proc object, which is stored as Lua userdata */
@@ -611,7 +625,7 @@ failure:
                     goto fd_failure;
                 if (i == STDIN_FILENO){
                     hfiles[i] = piper;
-                    fd = _open_osfhandle((intptr_t) pipew, binary ? 0 : _O_TEXT);
+                    fd = _open_osfhandle((long) pipew, binary ? 0 : _O_TEXT);
                     if (fd == -1){
                         strncpy(errmsg_out, "_open_osfhandle failed", errmsg_len + 1);
                         goto failure;
@@ -623,7 +637,7 @@ failure:
                     }
                 } else {
                     hfiles[i] = pipew;
-                    fd = _open_osfhandle((intptr_t) piper, _O_RDONLY | (binary ? 0 : _O_TEXT));
+                    fd = _open_osfhandle((long) piper, _O_RDONLY | (binary ? 0 : _O_TEXT));
                     if (fd == -1){
                         strncpy(errmsg_out, "_open_osfhandle failed", errmsg_len + 1);
                         goto failure;
