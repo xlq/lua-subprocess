@@ -31,6 +31,7 @@
 #include "errno.h"
 #include "sys/wait.h"
 #include "sys/stat.h"
+#include "assert.h"
 
 #define PIPE_ENV "subprocess_pipe_env"
 #define SUBPROCESS_UDATA_META "subprocess_udata_metatable"
@@ -39,6 +40,23 @@
 
 /* special constants for popen arguments */
 static char PIPE, STDOUT;
+
+/* Checks to see if object at acceptable index is a file object.
+   Returns file object if it is, or NULL if it is not. */
+static FILE *isfilep(lua_State *L, int index)
+{
+    int iseq;
+    FILE **fp;
+    if (!lua_isuserdata(L, index)) return NULL;
+    lua_getmetatable(L, index);
+    luaL_getmetatable(L, LUA_FILEHANDLE);
+    iseq = lua_rawequal(L, -1, -2);
+    lua_pop(L, 2);
+    if (!iseq) return NULL;
+    fp = lua_touserdata(L, index);
+    if (!fp) return NULL;
+    return *fp;
+}
 
 /* Creates new Lua file object.
    Leaves object on top of stack.
@@ -50,6 +68,18 @@ static FILE **newfile(lua_State *L)
     luaL_getmetatable(L, LUA_FILEHANDLE);
     lua_setmetatable(L, -2);
     return fp;
+}
+
+/* Turn a FILE* object into a Lua pipe and push it on the stack */
+static int ftopipe(lua_State *L, FILE *f)
+{
+    FILE **fp;
+
+    fp = newfile(L);
+    lua_getfield(L, LUA_REGISTRYINDEX, PIPE_ENV);
+    lua_setfenv(L, -2);
+    *fp = f;
+    return 1;
 }
 
 /* Turn a file descriptor into a lovely Lua file object.
@@ -104,86 +134,251 @@ struct spudata {
 
 static const char *fd_names[3] = {"stdin", "stdout", "stderr"};
 
+struct fdinfo {
+    enum {
+        FDMODE_INHERIT = 0,  /* fd is inherited from parent */
+        FDMODE_FILENAME,     /* open named file */
+        FDMODE_FILEDES,      /* use a file descriptor */
+        FDMODE_FILEOBJ,      /* use FILE* */
+        FDMODE_PIPE,         /* create and use pipe */
+        FDMODE_STDOUT        /* redirect to stdout (only for stderr) */
+    } mode;
+    union {
+        char *filename;
+        int filedes;
+        FILE *fileobj;
+    } info;
+};
+
+static void closefds(int *fds, int n)
+{
+    int i;
+    for (i=0; i<n; ++i)
+        if (fds[i] != -1)
+            close(fds[i]);
+}
+
+static void closefiles(FILE **files, int n)
+{
+    int i;
+    for (i=0; i<n; ++i)
+        if (files[i] != NULL)
+            fclose(files[i]);
+}
+
+static void freestrings(char **strs, int n)
+{
+    int i;
+    for (i=0; i<n; ++i)
+        if (strs[i] != NULL)
+            free(strs[i]);
+}
+
+/* Function for opening subprocesses. Returns 0 on success and -1 on failure. */
+static int dopopen(char *const *args,       /* program arguments with NULL sentinel */
+                   const char *executable,  /* actual executable */
+                   struct fdinfo fdinfo[3], /* info for stdin/stdout/stderr */
+                   int close_fds,           /* 1 to close all fds */
+                   const char *cwd,         /* working directory for program */
+                   int *errno_out,          /* set on failure */
+                   pid_t *pid_out,          /* set on success! */
+                   FILE *pipe_ends_out[3]   /* pipe ends are put here */
+                  )
+{
+    int fds[3];
+    int i;
+    struct fdinfo *fdi;
+    int piperw[2];
+    int errpipe[2]; /* pipe for returning error status */
+    int flags;
+    int en; /* saved errno */
+    int count;
+    pid_t pid;
+
+    for (i=0; i<3; ++i)
+        pipe_ends_out[i] = NULL;
+
+    /* Manage stdin/stdout/stderr */
+    for (i=0; i<3; ++i){
+        fdi = &fdinfo[i];
+        switch (fdi->mode){
+            case FDMODE_INHERIT:
+inherit:
+                if ((fds[i] = dup(i)) == -1){
+fd_failure:
+                    *errno_out = errno;
+                    closefds(fds, i);
+                    closefiles(pipe_ends_out, i);
+                    return -1;
+                }
+                break;
+            case FDMODE_FILENAME:
+                if (i == STDIN_FILENO){
+                    if ((fds[i] = creat(fdi->info.filename, 0666)) == -1) goto fd_failure;
+                } else {
+                    if ((fds[i] = open(fdi->info.filename, O_RDONLY)) == -1) goto fd_failure;
+                }
+                break;
+            case FDMODE_FILEDES:
+                if ((fds[i] = dup(fdi->info.filedes)) == -1) goto fd_failure;
+                break;
+            case FDMODE_FILEOBJ:
+                if ((fds[i] = dup(fileno(fdi->info.fileobj))) == -1) goto fd_failure;
+                break;
+            case FDMODE_PIPE:
+                if (pipe(piperw) == -1) goto fd_failure;
+                if (i == STDIN_FILENO){
+                    fds[i] = piperw[0]; /* give read end to process */
+                    if ((pipe_ends_out[i] = fdopen(piperw[1], "w")) == NULL) goto fd_failure;
+                } else {
+                    fds[i] = piperw[1]; /* give write end to process */
+                    if ((pipe_ends_out[i] = fdopen(piperw[0], "r")) == NULL) goto fd_failure;
+                }
+                break;
+            case FDMODE_STDOUT:
+                if (i == STDERR_FILENO){
+                    if ((fds[STDERR_FILENO] = dup(fds[STDOUT_FILENO])) == -1) goto fd_failure;
+                } else goto inherit;
+                break;
+        }
+    }
+    
+    /* Find executable name */
+    if (!executable){
+        /* use first arg */
+        executable = args[0];
+    }
+    assert(executable != NULL);
+
+    /* Create a pipe for returning error status */
+    if (pipe(errpipe) == -1){
+        *errno_out = errno;
+        closefds(fds, 3);
+        closefiles(pipe_ends_out, 3);
+        return -1;
+    }
+    /* Make write end close on exec */
+    flags = fcntl(errpipe[1], F_GETFD);
+    if (flags == -1){
+pipe_failure:
+        *errno_out = errno;
+        closefds(errpipe, 2);
+        closefds(fds, 3);
+        closefiles(pipe_ends_out, 3);
+        return -1;
+    }
+    if (fcntl(errpipe[1], F_SETFD, flags | FD_CLOEXEC) == -1) goto pipe_failure;
+
+    /* Do the fork/exec (TODO: use vfork somehow?) */
+    pid = fork();
+    if (pid == -1) goto pipe_failure;
+    else if (pid == 0){
+        /* child */
+        close(errpipe[0]);
+        
+        /* dup file descriptors */
+        for (i=0; i<3; ++i){
+            if (dup2(fds[i], i) == -1) goto child_failure;
+        }
+
+        /* close other fds */
+        if (close_fds){
+            for (i=3; i<sysconf(_SC_OPEN_MAX); ++i){
+                if (i != errpipe[1])
+                    close(i);
+            }
+        }
+
+        /* change directory */
+        if (cwd && chdir(cwd)) goto child_failure;
+
+        /* exec! Farewell, subprocess.c! */
+        execvp(executable, args);
+
+        /* Oh dear, we're still here. */
+child_failure:
+        en = errno;
+        write(errpipe[1], &en, sizeof en);
+        _exit(1);
+    }
+
+    /* parent */
+    /* close unneeded fds */
+    closefds(fds, 3);
+    close(errpipe[1]);
+    
+    /* read errno from child */
+    while ((count = read(errpipe[0], &en, sizeof en)) == -1)
+        if (errno != EAGAIN && errno != EINTR) break;
+    if (count > 0){
+        /* exec failed */
+        close(errpipe[0]);
+        *errno_out = en;
+        return -1;
+    }
+    close(errpipe[0]);
+
+    /* Child is now running */
+    *pid_out = pid;
+    return 0;
+}
+
 /* popen {arg0, arg1, arg2, ..., [executable=...]} */
 static int superpopen(lua_State *L)
 {
+    struct spudata *spup;
+
     /* List of arguments (malloc'd NULL-terminated array of malloc'd C strings) */
-    size_t nargs = 0;
+    int nargs = 0;
     char **args = NULL;
     /* Command to run (malloc'd) */
-    char *command = NULL;
+    char *executable = NULL;
     /* Directory to run it in */
     char *cwd = NULL;
-    /* pipe to pass error info from child to parent */
-    int errpipe[2];
-    /* files for stdin, stdout, stderr of child process */
-    int fds[3];
-    /* other ends of pipes */
-    int pipes[3];
-    
-    /* Each of these corresponds to a variable above.
-       If set to one, the relevant
-       file descriptor is closed on error. */
-    unsigned char errpipe_set[2] = {0, 0};
-    unsigned char fds_set[3] = {0, 0, 0},
-                  pipes_set[3] = {0, 0, 0};
+    /* File options */
+    struct fdinfo fdinfo[3];
+    /* Close fds? */
+    int close_fds = 0;
 
-    /* Close fd in parent after fork? */
-    unsigned char fds_close[3] = {1, 1, 1};
-
-    unsigned char close_fds;
-    const char *s;
-    pid_t pid;
-    int flags, en, count;
-    size_t i;
-    struct spudata *spup;
-    int p[2];
+    int en = 0; /* errno copy */
+    pid_t pid = -1; /* child's pid */
+    FILE *pipe_ends[3] = {NULL, NULL, NULL};
+    int i, j, result;
     struct stat statbuf;
-
-    luaL_checktype(L, 1, LUA_TTABLE);
+    FILE *f;
+    const char *s;
+    
     /* get arguments */
     nargs = lua_objlen(L, 1);
-    args = malloc((nargs + 1) * sizeof(char *));
-    if (!args){
-        lua_pushstring(L, "memory full");
-        goto fail;
-    }
+    if (nargs == 0) return luaL_error(L, "no arguments specified");
+    args = malloc((nargs + 1) * sizeof *args);
+    if (!args) return luaL_error(L, "memory full");
     for (i=0; i<=nargs; ++i) args[i] = NULL;
     for (i=1; i<=nargs; ++i){
         lua_rawgeti(L, 1, i);
-        s = lua_tolstring(L, -1, NULL);
+        s = lua_tostring(L, -1);
         if (!s){
-            lua_pushfstring(L, "popen argument %d not a string", (int) i);
-            goto fail;
+            freestrings(args, nargs);
+            free(args);
+            return luaL_error(L, "popen argument %d not a string", (int) i);
+
         }
         args[i-1] = strdup(s);
+        if (args[i-1] == NULL){
+strings_failure:
+            freestrings(args, nargs);
+            free(args);
+            return luaL_error(L, "memory full");
+        }
         lua_pop(L, 1);
     }
     
-    /* get command string */
+    /* get executable string */
     lua_getfield(L, 1, "executable");
-    if (!lua_isnil(L, -1)){
-        /* use given string as command */
-        s = lua_tolstring(L, -1, NULL);
-        if (!s) goto use_args0;
-        command = strdup(s);
-        if (!command){
-            lua_pushstring(L, "memory full");
-            goto fail;
-        }
-    } else {
-use_args0:
-        /* use args[0] as command */
-        if (nargs > 0){
-            command = strdup(args[0]);
-            if (!command){
-                lua_pushstring(L, "memory full");
-                goto fail;
-            }
-        } else {
-            lua_pushstring(L, "no command or arguments specified");
-            goto fail;
-        }
+    s = lua_tostring(L, -1);
+    if (s){
+        executable = strdup(s);
+        if (executable == NULL) goto strings_failure;
     }
     lua_pop(L, 1); /* to match lua_getfield */
 
@@ -191,14 +386,19 @@ use_args0:
     lua_getfield(L, 1, "cwd");
     if (lua_isstring(L, -1)){
         cwd = strdup(lua_tostring(L, -1));
-        /* Does the dir exist? */
-        if (stat(cwd, &statbuf)){
-            lua_pushfstring(L, "Cannot chdir to %s: %s", cwd, strerror(errno));
-            goto fail;
+        if (!cwd){
+            free(executable);
+            freestrings(args, nargs);
+            free(args);
+            return luaL_error(L, "memory full");
         }
-    } else if (!lua_isnil(L, -1)){
-        lua_pushfstring(L, "string expected for cwd (got %s)", lua_typename(L, lua_type(L, -1)));
-        goto fail;
+        /* make sure the cwd exists */
+        if (stat(cwd, &statbuf)){
+            free(executable);
+            freestrings(args, nargs);
+            free(args);
+            return luaL_error(L, "cannot chdir to `%s': %s", cwd, strerror(errno));
+        }
     }
     lua_pop(L, 1);
 
@@ -211,142 +411,62 @@ use_args0:
     for (i=0; i<3; ++i){
         lua_getfield(L, 1, fd_names[i]);
         if (lua_isnil(L, -1)){
-            /* not specified; boring */
+            fdinfo[i].mode = FDMODE_INHERIT;
         } else if (lua_touserdata(L, -1) == &PIPE){
-            /* create a new pipe */
-            if (pipe(p)) goto errno_fail;
-            if (i == 0){
-                /* stdin */
-                fds[0] = p[0];
-                pipes[0] = p[1];
-                fds_set[0] = 1;
-                pipes_set[0] = 1;
-            } else {
-                /* stdout/stderr */
-                fds[i] = p[1];
-                pipes[i] = p[0];
-                fds_set[i] = 1;
-                pipes_set[i] = 1;
-            }
+            fdinfo[i].mode = FDMODE_PIPE;
         } else if (lua_touserdata(L, -1) == &STDOUT){
-            if (i == 2 && pipes_set[1]){
-                /* send stderr to stdout */
-                fds[2] = fds[1];
-                fds_set[2] = 1;
+            if (i == STDERR_FILENO && fdinfo[STDOUT_FILENO].mode == FDMODE_PIPE){
+                fdinfo[i].mode = FDMODE_STDOUT;
             } else {
-                lua_pushstring(L, "only set stderr to STDOUT, and only when stdout=PIPE");
-                goto fail;
+                lua_pushstring(L, "STDOUT must be used only for stderr when stdout is set to PIPE");
+files_failure:
+                for (j=0; j<i; ++j){
+                    if (fdinfo[j].mode == FDMODE_FILENAME)
+                        free(fdinfo[j].info.filename);
+                }
+                free(executable);
+                freestrings(args, nargs);
+                free(args);
+                return lua_error(L);
             }
         } else if (lua_isstring(L, -1)){
             /* open a file */
-            s = lua_tostring(L, -1);
-            if (s){
-                if (i == 0){
-                    p[0] = open(s, O_RDONLY);
-                } else {
-                    p[0] = open(s, O_WRONLY);
-                }
-                if (!p[0]){
-                    /* XXX: can I give lua_pushfstring a string from lua_tostring? */
-                    lua_pushfstring(L, "cannot open %s: %s", s, strerror(errno));
-                    goto fail;
-                }
-                fds[i] = p[0];
-                fds_set[i] = 1;
-            } else {
-                /* shrug */
+            fdinfo[i].mode = FDMODE_FILENAME;
+            if ((fdinfo[i].info.filename = strdup(lua_tostring(L, -1))) == NULL){
+                lua_pushstring(L, "out of memory");
+                goto files_failure;
             }
         } else if (lua_isnumber(L, -1)){
             /* use this fd */
-            fds[i] = lua_tointeger(L, -1);
-            fds_set[i] = 1;
-            fds_close[i] = 0; /* do not close it */
+            fdinfo[i].mode = FDMODE_FILEDES;
+            fdinfo[i].info.filedes = lua_tointeger(L, -1);
         } else {
-            /* huh? */
-            lua_pushfstring(L, "unexpected value for %s", fd_names[i]);
-            goto fail;
+            f = isfilep(L, -1);
+            if (f){
+                fdinfo[i].mode = FDMODE_FILEOBJ;
+                fdinfo[i].info.fileobj = f;
+            } else {
+                /* huh? */
+                lua_pushfstring(L, "unexpected value for %s", fd_names[i]);
+                goto files_failure;
+            }
         }
         lua_pop(L, 1);
     }
 
-
-    /* create a pipe for returning error status */
-    if (pipe(errpipe)){
-errno_fail:
-        lua_pushstring(L, strerror(errno));
-        goto fail;
-    }
-    errpipe_set[0] = 1;
-    errpipe_set[1] = 1;
-    flags = fcntl(errpipe[1], F_GETFD);
-    if (flags == -1) goto errno_fail;
-    if (fcntl(errpipe[1], F_SETFD, flags | FD_CLOEXEC)) goto errno_fail;
-
-    /* do the fork/exec (TODO: use vfork?) */
-    pid = fork();
-    if (pid == -1) goto errno_fail;
-    else if (pid == 0){
-        /* child */
-        close(errpipe[0]);
-        /* dup file descriptors */
-        for (i=0; i<3; ++i){
-            if (fds_set[i])
-                dup2(fds[i], i);
-        }
-        /* close other fds */
-        if (close_fds){
-            for (i=3; i<(unsigned)sysconf(_SC_OPEN_MAX); ++i)
-                close(i);
-        }
-        /* change directory */
-        if (cwd && chdir(cwd)){
-            en = errno;
-            write(errpipe[1], &en, sizeof(int));
-            _exit(1);
-        }
-        /* exec! Farewell, process state. */
-        execvp(command, args);
-        /* Oh dear, we're still here. */
-        en = errno;
-        write(errpipe[1], &en, sizeof(int));
-        _exit(1);
-    }
-    /* parent */
-    /* close unneeded fds */
-    close(errpipe[1]);
-    errpipe_set[1] = 0;
-    if (fds_set[1] && fds_set[2] && fds[1] == fds[2])
-        fds_set[2] = 0;
-    for (i=0; i<3; ++i){
-        if (fds_set[i]){
-            if (fds_close[i])
-                close(fds[i]);
-            fds_set[i] = 0;
-        }
-    }
-    /* free unneeded info */
-    free(cwd);
-    free(command);
-    command = NULL;
-    for (i=0; i<nargs; ++i) free(args[i]);
+    result = dopopen(args, executable, fdinfo, close_fds, cwd, &en, &pid, pipe_ends);
+    for (i=0; i<3; ++i)
+        if (fdinfo[i].mode == FDMODE_FILENAME)
+            free(fdinfo[i].info.filename);
+    free(executable);
+    freestrings(args, nargs);
     free(args);
-    args = NULL;
-
-    /* read errno from child */
-    while ((count = read(errpipe[0], &en, sizeof(int))) == -1)
-        if (errno != EAGAIN && errno != EINTR) break;
-    if (count > 0){
-        /* exec failed */
-        close(errpipe[0]);
-        lua_pushnil(L);
-        lua_pushstring(L, strerror(en));
-        lua_pushinteger(L, en);
-        return 3;
+    if (result == -1){
+        /* failed */
+        return luaL_error(L, "popen failed: %s", strerror(en));
     }
-    close(errpipe[0]);
-    errpipe_set[0] = 0;
 
-    /* Child is now running. */
+    /* Create popen object: it has two parts, the table part and the userdata part. */
     /* Create table for subprocess info */
     lua_createtable(L, 0, 2);
     luaL_getmetatable(L, SUBPROCESS_META);
@@ -359,45 +479,18 @@ errno_fail:
     spup->done = 0;
     /* Put userdata in table */
     lua_setfield(L, -2, "_subprocess");
+    /* Set pid */
     lua_pushinteger(L, pid);
     lua_setfield(L, -2, "pid");
+    /* Set pipe objects */
     for (i=0; i<3; ++i){
-        if (pipes_set[i]){
-            if (i==2 && pipes_set[1] && pipes[1] == pipes[2]){
-                lua_getfield(L, -1, "stdout");
-                lua_setfield(L, -2, "stderr");
-            } else {
-                if (!superfdopen(L, pipes[i], (i==0)?"w":"r")){
-                    /* not much we can do; just close it */
-                    close(pipes[i]);
-                    fprintf(stderr, "fdopen failed after fork and exec: %s\n", lua_tostring(L, -1));
-                    lua_pop(L, 1); /* pop error message */
-                } else {
-                    lua_setfield(L, -2, fd_names[i]);
-                }
-            }
+        if (pipe_ends[i]){
+            ftopipe(L, pipe_ends[i]);
+            lua_setfield(L, -2, fd_names[i]);
         }
     }
-
     /* Return the table */
     return 1;
-fail:
-    if (fds_set[1] && fds_set[2] && fds[1] == fds[2])
-        fds_set[2] = 0;
-    if (pipes_set[1] && pipes_set[2] && pipes[1] == pipes[2])
-        pipes_set[2] = 0;
-    for (i=0; i<3; ++i){
-        if (fds_set[i]) close(fds[i]);
-        if (pipes_set[i]) close(pipes[i]);
-    }
-    for (i=0; i<2; ++i)
-        if (errpipe_set[i])
-            close(errpipe[i]);
-    free(command);
-    free(cwd);
-    for (i=0; i<nargs; ++i) free(args[i]);
-    free(args);
-    return lua_error(L);
 }
 
 static inline struct spudata *checksp(lua_State *L)
