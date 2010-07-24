@@ -161,6 +161,29 @@ static void doneproc(lua_State *L, int index)
     }
 }
 
+/* Remove old SP_LIST entries by polling them.
+   Calling this every now and again can avoid leaking proc objects
+   that are not waited for. */
+static int prune(lua_State *L)
+{
+    int top = lua_gettop(L);
+    lua_checkstack(L, 5);
+    lua_rawgeti(L, LUA_ENVIRONINDEX, SP_LIST);
+    if (lua_isnil(L, -1)){
+        lua_pop(L, 1);
+        return 0;
+    }
+    lua_pushnil(L);
+    while (lua_next(L, -2)){
+        lua_getfield(L, -1, "poll");
+        lua_pushvalue(L, -2);
+        lua_call(L, 1, 0);
+        lua_pop(L, 1);
+    }
+    lua_settop(L, top);
+    return 0;
+}
+
 /* Special constants for popen arguments. */
 static char PIPE, STDOUT;
 
@@ -691,6 +714,8 @@ static int superpopen(lua_State *L)
 
     char errmsg_buf[256];
 
+    prune(L);
+
     luaL_checktype(L, 1, LUA_TTABLE);
     lua_settop(L, 1);
 
@@ -843,6 +868,7 @@ files_failure:
 static int proc_gc(lua_State *L)
 {
     struct proc *proc = checkproc(L, 1);
+    puts("proc_gc");
     if (!proc->done){
 #if defined(OS_POSIX)
         /* Try to wait for process to avoid leaving zombie.
@@ -1225,6 +1251,7 @@ static const luaL_Reg subprocess[] = {
     {"call", call},
     {"call_capture", call_capture},
     {"wait", superwait},
+    {"prune", prune},
     {NULL, NULL}
 };
 
