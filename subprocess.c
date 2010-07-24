@@ -660,9 +660,9 @@ failure:
     CloseHandle(pi.hThread); /* Don't want this handle */
     free(cmdline);
     closefds(hfiles, 3); /* XXX: is this correct? */
-    ci_out->done = 0;
-    ci_out->pid = pi.dwProcessId;
-    ci_out->hProcess = pi.hProcess;
+    proc->done = 0;
+    proc->pid = pi.dwProcessId;
+    proc->hProcess = pi.hProcess;
     return 0;
 }
 #endif
@@ -1018,7 +1018,7 @@ static int proc_kill(lua_State *L)
     return proc_send_signal(L);
 }
 #elif defined(OS_WINDOWS)
-static int sp_terminate(lua_State *L)
+static int proc_terminate(lua_State *L)
 {
     struct proc *proc = checkproc(L, 1);
     if (!proc->done){
@@ -1101,13 +1101,13 @@ static int call_capture(lua_State *L)
 
 static int superwait(lua_State *L)
 {
-    int stat;
-    int exitcode;
     struct proc *proc;
 #if defined(OS_POSIX)
+    int stat;
     pid_t pid;
+    int exitcode;
 #elif defined(OS_WINDOWS)
-    HANDLE *handles, hProcess;
+    HANDLE *handles = NULL, hProcess;
     int i, nprocs;
     DWORD retval;
     DWORD exitcode;
@@ -1170,10 +1170,10 @@ static int superwait(lua_State *L)
     if (i > 0){
         if (i > MAXIMUM_WAIT_OBJECTS){
             free(handles);
-            return luaL_error("too many wait objects: %d", i);
+            return luaL_error(L, "too many wait objects: %d", i);
         }
         retval = WaitForMultipleObjects(i, handles, FALSE, INFINITE);
-        if (retval >= WAIT_OBJECT_0 && retval < WAIT_OBJECT_0 + i){
+        if (retval >= WAIT_OBJECT_0 && retval < (DWORD)(WAIT_OBJECT_0 + i)){
             hProcess = handles[retval - WAIT_OBJECT_0];
             free(handles);
             /* find this process again in the table */
@@ -1208,7 +1208,7 @@ static int superwait(lua_State *L)
             return lua_error(L);
         } else {
             free(handles);
-            return luaL_error("WaitForMultipleObjects failed unexpectedly");
+            return luaL_error(L, "WaitForMultipleObjects failed unexpectedly");
         }
     } else {
         free(handles);
