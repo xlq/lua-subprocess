@@ -34,6 +34,7 @@
 #include "fcntl.h"
 #include "errno.h"
 #include "assert.h"
+#include "liolib-copy.h"
 #if defined(OS_POSIX)
 #include "sys/wait.h"
 #include "sys/stat.h"
@@ -71,54 +72,13 @@ static int direxists(const char *fname)
 
 #endif
 
-#define PIPE_ENV "subprocess_pipe_env"
+/* #define PIPE_ENV "subprocess_pipe_env" */
 #define SUBPROCESS_CI_META "subprocess_child_info_metatable"
 #define SUBPROCESS_META "subprocess_table_metatable"
-#define tofilep(L)	((FILE **) luaL_checkudata(L, 1, LUA_FILEHANDLE))
+/*#define tofilep(L)	((FILE **) luaL_checkudata(L, 1, LUA_FILEHANDLE))*/
 
 /* special constants for popen arguments */
 static char PIPE, STDOUT;
-
-/* Checks to see if object at acceptable index is a file object.
-   Returns file object if it is, or NULL if it is not. */
-static FILE *isfilep(lua_State *L, int index)
-{
-    int iseq;
-    FILE **fp;
-    if (!lua_isuserdata(L, index)) return NULL;
-    lua_getmetatable(L, index);
-    luaL_getmetatable(L, LUA_FILEHANDLE);
-    iseq = lua_rawequal(L, -1, -2);
-    lua_pop(L, 2);
-    if (!iseq) return NULL;
-    fp = lua_touserdata(L, index);
-    if (!fp) return NULL;
-    return *fp;
-}
-
-/* Creates new Lua file object.
-   Leaves object on top of stack.
-   Returns FILE** that can be set. */
-static FILE **newfile(lua_State *L)
-{
-    FILE **fp = lua_newuserdata(L, sizeof(FILE *));
-    *fp = NULL;
-    luaL_getmetatable(L, LUA_FILEHANDLE);
-    lua_setmetatable(L, -2);
-    return fp;
-}
-
-/* Turn a FILE* object into a Lua pipe and push it on the stack */
-static int ftopipe(lua_State *L, FILE *f)
-{
-    FILE **fp;
-
-    fp = newfile(L);
-    lua_getfield(L, LUA_REGISTRYINDEX, PIPE_ENV);
-    lua_setfenv(L, -2);
-    *fp = f;
-    return 1;
-}
 
 /* Turn a file descriptor into a lovely Lua file object.
    Return value:
@@ -144,7 +104,7 @@ static int ftopipe(lua_State *L, FILE *f)
 }*/
 
 /* __close method for a pipe */
-static int close_pipe(lua_State *L)
+/*static int close_pipe(lua_State *L)
 {
     int ok, err;
     FILE **p;
@@ -164,7 +124,7 @@ static int close_pipe(lua_State *L)
         lua_pushinteger(L, err);
         return 3;
     }
-}
+}*/
 
 static const char *fd_names[3] = {"stdin", "stdout", "stderr"};
 
@@ -623,7 +583,17 @@ failure:
         return -1;
     }
 
-    
+    si.cb = sizeof si;
+    si.lpReserved = NULL;
+    si.lpDesktop = NULL;
+    si.lpTitle = NULL;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.cbReserved2 = 0;
+    si.lpReserved2 = NULL;
+    si.hStdInput = hfiles[0];
+    si.hStdOutput = hfiles[1];
+    si.hStdError = hfiles[2];
+
     if (CreateProcess(
         executable, /* lpApplicationName */
         cmdline,    /* lpCommandLine */
@@ -645,7 +615,6 @@ failure:
     CloseHandle(pi.hThread); /* Don't want this handle */
     free(cmdline);
     closefds(hfiles, 3); /* XXX: is this correct? */
-    closefiles(pipe_ends_out, 3);
     ci_out->pid = pi.dwProcessId;
     ci_out->hProcess = pi.hProcess;
     return 0;
@@ -771,7 +740,7 @@ files_failure:
             fdinfo[i].mode = FDMODE_FILEDES;
             fdinfo[i].info.filedes = (filedes_t) lua_tointeger(L, -1);
         } else {
-            f = isfilep(L, -1);
+            f = liolib_copy_tofile(L, -1);
             if (f){
                 fdinfo[i].mode = FDMODE_FILEOBJ;
                 fdinfo[i].info.fileobj = f;
@@ -815,7 +784,7 @@ files_failure:
     /* Set pipe objects */
     for (i=0; i<3; ++i){
         if (pipe_ends[i]){
-            ftopipe(L, pipe_ends[i]);
+            *liolib_copy_newfile(L) = pipe_ends[i];
             lua_setfield(L, -2, fd_names[i]);
         }
     }
@@ -1090,121 +1059,12 @@ static int superwait(lua_State *L)
 }
 #endif
 
-static int test(lua_State *L)
-{
-#if 0
-    HANDLE rpipe, wpipe;
-    int rfd, wfd;
-    FILE *rf, *wf;
-    if (CreatePipe(&rpipe, &wpipe, NULL, 16384) == 0){
-        return luaL_error(L, "CreatePipe failed");
-    }
-    rfd = _open_osfhandle((intptr_t) rpipe, _O_RDONLY);
-    if (rfd == 0){
-        lua_pushliteral(L, "_open_osfhandle failed");
-        CloseHandle(rpipe);
-        CloseHandle(wpipe);
-        return lua_error(L);
-    }
-    rf = _fdopen(rfd, "r");
-    if (!rf){
-        lua_pushfstring(L, "_fdopen failed: %s", strerror(errno));
-        _close(rfd);
-        CloseHandle(wpipe);
-        return lua_error(L);
-    }
-    wfd = _open_osfhandle((intptr_t) wpipe, 0);
-    if (wfd == 0){
-        lua_pushliteral(L, "_open_osfhandle failed");
-        fclose(rf);
-        CloseHandle(wpipe);
-        return lua_error(L);
-    }
-    wf = _fdopen(wfd, "w");
-    if (!wf){
-        lua_pushfstring(L, "_fdopen failed: %s", strerror(errno));
-        fclose(rf);
-        _close(wfd);
-        return lua_error(L);
-    }
-    ftopipe(L, rf);
-    ftopipe(L, wf);
-    return 2;
-#endif
-
-    SECURITY_ATTRIBUTES secattr;
-    STARTUPINFO si;
-    PROCESS_INFORMATION pi;
-    HANDLE rpipe, wpipe, hFile0, hFile2;
-    int fd;
-    DWORD bread;
-    FILE *f;
-    char buf[256];
-
-    secattr.nLength = sizeof secattr;
-    secattr.lpSecurityDescriptor = NULL;
-    secattr.bInheritHandle = TRUE;
-    if (CreatePipe(&rpipe, &wpipe, &secattr, 0) == 0){
-        puts("CreatePipe failed");
-        return 0;
-    }
-    if (DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_INPUT_HANDLE),
-        GetCurrentProcess(), &hFile0, 0, TRUE, DUPLICATE_SAME_ACCESS) == 0)
-    {
-        puts("DuplicateHandle failed");
-        return 0;
-    }
-    if (DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE),
-        GetCurrentProcess(), &hFile2, 0, TRUE, DUPLICATE_SAME_ACCESS) == 0)
-    {
-        puts("DuplicateHandle failed");
-        return 0;
-    }
-    si.cb = sizeof si;
-    si.lpReserved = NULL;
-    si.lpDesktop = NULL;
-    si.lpTitle = NULL;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.cbReserved2 = 0;
-    si.lpReserved2 = NULL;
-    si.hStdInput = hFile0;
-    si.hStdOutput = wpipe;
-    si.hStdError = hFile2;
-    if (CreateProcess(
-        "printargs.exe",
-        "printargs.exe one two three",
-        NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)
-    == 0){
-        puts("CreateProcess failed");
-        return 0;
-    }
-    CloseHandle(hFile0);
-    CloseHandle(hFile2);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    CloseHandle(wpipe);
-    
-    fd = _open_osfhandle((intptr_t) rpipe, _O_RDONLY);
-    if (fd == -1){
-        puts("_open_osfhandle failed");
-        return 0;
-    }
-    f = _fdopen(fd, "r");
-    if (!f){
-        puts("_fdopen failed");
-        return 0;
-    }
-
-    return ftopipe(L, f);
-}
-
 static const luaL_Reg subprocess[] = {
     /* {"pipe", superpipe}, */
     {"popen", superpopen},
     {"call", call},
     {"call_capture", call_capture},
     /* {"wait", superwait}, */
-    {"test", test},
     {NULL, NULL}
 };
 
@@ -1217,10 +1077,10 @@ LUALIB_API int luaopen_subprocess(lua_State *L)
     lua_setfield(L, -2, "STDOUT");
     
     /* create environment for pipes */
-    lua_createtable(L, 0, 1);
+    /*lua_createtable(L, 0, 1);
     lua_pushcfunction(L, close_pipe);
     lua_setfield(L, -2, "__close");
-    lua_setfield(L, LUA_REGISTRYINDEX, PIPE_ENV);
+    lua_setfield(L, LUA_REGISTRYINDEX, PIPE_ENV);*/
 
     /* create metatable for subprocesses' userdata */
     luaL_newmetatable(L, SUBPROCESS_CI_META);
