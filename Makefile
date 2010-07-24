@@ -2,7 +2,7 @@
 
 INSTALL ?= install
 ASCIIDOC ?= asciidoc
-SOURCES := subprocess.c
+SOURCES := subprocess.c liolib-copy.c
 VERSION := 0.01
 DISTDIR := subprocess-$(VERSION)
 DISTFILES := Makefile $(SOURCES) subprocess.txt subprocess.html
@@ -20,7 +20,7 @@ LUA_CFLAGS := $(shell pkg-config --cflags --libs lua)
 all: subprocess.so subprocess.html
 
 subprocess.so: $(SOURCES)
-	$(CC) $(CFLAGS) $(LUA_CFLAGS) -shared -fPIC -o $@ $(SOURCES)
+	$(CC) $(CFLAGS) $(LUA_CFLAGS) -DOS_POSIX -shared -fPIC -o $@ $(SOURCES)
 
 subprocess.html: subprocess.txt
 	$(ASCIIDOC) $<

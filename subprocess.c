@@ -21,7 +21,7 @@
 
 #if !defined(OS_WINDOWS) && !defined(OS_POSIX)
 #error None of these are defined: OS_WINDOWS, OS_POSIX
-#endif
+#else
 
 #define LUA_LIB
 #include "lua.h"
@@ -39,11 +39,8 @@
 #include "sys/wait.h"
 #include "sys/stat.h"
 typedef int filedes_t;
-struct child_info {
-    pid_t pid;
-    int exitcode;
-    unsigned char done; /* set to 1 when child has finished and closed. */
-};
+
+/* return 1 if the named directory exists and is a directory */
 static int direxists(const char *fname)
 {
     struct stat statbuf;
@@ -56,12 +53,8 @@ static int direxists(const char *fname)
 #elif defined(OS_WINDOWS)
 #include "windows.h"
 typedef HANDLE filedes_t;
-struct child_info {
-    HANDLE hProcess;
-    DWORD pid;
-    int exitcode;
-    unsigned char done; /* set to 1 when child has finished and closed. */
-};
+
+/* return 1 if the named directory exists and is a directory */
 static int direxists(const char *fname)
 {
     DWORD result;
@@ -72,62 +65,110 @@ static int direxists(const char *fname)
 
 #endif
 
-/* #define PIPE_ENV "subprocess_pipe_env" */
-#define SUBPROCESS_CI_META "subprocess_child_info_metatable"
-#define SUBPROCESS_META "subprocess_table_metatable"
-/*#define tofilep(L)	((FILE **) luaL_checkudata(L, 1, LUA_FILEHANDLE))*/
+/* This is the proc object, which is stored as Lua userdata */
+struct proc {
+#if defined(OS_POSIX)
+    pid_t pid;
+#elif defined(OS_WINDOWS)
+    DWORD pid;
+    HANDLE hProcess;
+#endif
+    unsigned char done; /* set to 1 when child has finished and closed */
+    int exitcode;
+};
 
-/* special constants for popen arguments */
+/* Lua registry key for proc metatable */
+#define SP_PROC_META "subprocess_proc*"
+
+/* Environment keys */
+#define SP_LIST 1                                    /* table of [pid]=proc */
+
+/* Function to count number of keys in a table.
+   Table must be at top of stack. */
+static int countkeys(lua_State *L)
+{
+    int i = 0;
+    lua_checkstack(L, 3);
+    lua_pushnil(L);
+    while (lua_next(L, -2)){
+        ++i;
+        lua_pop(L, 1);
+    }
+    return i;
+}
+
+/* Check to see if object at the given index is a proc object.
+   Return pointer to proc object, or NULL if it isn't. */
+static struct proc *toproc(lua_State *L, int index)
+{
+    int eq;
+    if (lua_type(L, index) != LUA_TUSERDATA) return NULL;
+    lua_getmetatable(L, index);
+    luaL_getmetatable(L, SP_PROC_META);
+    eq = lua_equal(L, -2, -1);
+    lua_pop(L, 2);
+    if (!eq) return NULL;
+    return lua_touserdata(L, index);
+}
+
+/* Same but raise an error instead of returning NULL */
+#define checkproc(L, index) ((struct proc *) luaL_checkudata((L), (index), SP_PROC_META))
+
+/* Create and return a new proc object */
+static struct proc *newproc(lua_State *L)
+{
+    struct proc *proc = lua_newuserdata(L, sizeof *proc);
+    proc->done = 1;
+    proc->pid = 0;
+    luaL_getmetatable(L, SP_PROC_META);
+    lua_setmetatable(L, -2);
+    lua_newtable(L);
+    lua_setfenv(L, -2);
+    return proc;
+}
+
+/* Mark a process (at index) as done */
+static void doneproc(lua_State *L, int index)
+{
+    struct proc *proc = toproc(L, index);
+    if (!proc){
+        fputs("subprocess.c: doneproc: not a proc\n", stderr);
+    } else {
+        proc->done = 1;
+        /* remove proc from SP_LIST */
+        lua_checkstack(L, 4);
+        lua_pushvalue(L, index);    /* stack: proc */
+        lua_rawgeti(L, LUA_ENVIRONINDEX, SP_LIST);
+        /* stack: proc list */
+        if (lua_isnil(L, -1)){
+            fputs("subprocess.c: XXX: SP_LIST IS NIL\n", stderr);
+        } else {
+            lua_pushinteger(L, proc->pid);      /* stack: proc list pid */
+            lua_pushvalue(L, -1);               /* stack: proc list pid pid */
+            lua_gettable(L, -3);                /* stack: proc list pid proc2 */
+            if (!lua_equal(L, -4, -1)){
+                /* lookup by pid didn't work */
+                fputs("subprocess.c: doneproc: XXX: pid lookup in SP_LIST failed\n", stderr);
+                lua_pop(L, 2);                  /* stack: proc list */
+            } else {
+                lua_pop(L, 1);                  /* stack: proc list pid */
+                lua_pushnil(L);                 /* stack: proc list pid nil */
+                lua_settable(L, -3);            /* stack: proc list */
+            }
+            /* stack: proc list */
+        }
+        lua_pop(L, 2);
+    }
+}
+
+/* Special constants for popen arguments. */
 static char PIPE, STDOUT;
 
-/* Turn a file descriptor into a lovely Lua file object.
-   Return value:
-     1:  success, file object is on top of stack
-     0:  failure, error message is on top of stack */
-/*static int superfdopen(lua_State *L, int fd, const char *mode)
-{
-    FILE **fp;
-    int en;
-
-    fp = newfile(L);
-    lua_getfield(L, LUA_REGISTRYINDEX, PIPE_ENV);
-    lua_setfenv(L, -2);
-    *fp = fdopen(fd, mode);
-    if (!*fp){
-        en = errno;
-        lua_pop(L, 1);
-        lua_pushfstring(L, "fdopen: %s", strerror(en));
-        return 0;
-    } else {
-        return 1;
-    }
-}*/
-
-/* __close method for a pipe */
-/*static int close_pipe(lua_State *L)
-{
-    int ok, err;
-    FILE **p;
-
-    puts("Here I am, in close_pipe");
-    
-    p = tofilep(L);
-    ok = fclose(*p);
-    *p = NULL;
-    if (ok){
-        lua_pushboolean(L, 1);
-        return 1;
-    } else {
-        err = errno;
-        lua_pushnil(L);
-        lua_pushfstring(L, "(pipe): %s", strerror(err));
-        lua_pushinteger(L, err);
-        return 3;
-    }
-}*/
-
+/* Names of standard file handles. */
 static const char *fd_names[3] = {"stdin", "stdout", "stderr"};
 
+/* Information about what to do for a standard file handle.
+   This is constructed from popen arguments. */
 struct fdinfo {
     enum {
         FDMODE_INHERIT = 0,  /* fd is inherited from parent */
@@ -144,6 +185,7 @@ struct fdinfo {
     } info;
 };
 
+/* Close multiple file descriptors */
 static void closefds(filedes_t *fds, int n)
 {
     int i;
@@ -158,6 +200,7 @@ static void closefds(filedes_t *fds, int n)
     }
 }
 
+/* Close multiple C files */
 static void closefiles(FILE **files, int n)
 {
     int i;
@@ -166,6 +209,7 @@ static void closefiles(FILE **files, int n)
             fclose(files[i]);
 }
 
+/* Free multiple strings */
 static void freestrings(char **strs, int n)
 {
     int i;
@@ -294,7 +338,7 @@ static int dopopen(char *const *args,        /* program arguments with NULL sent
                    struct fdinfo fdinfo[3],  /* info for stdin/stdout/stderr */
                    int close_fds,            /* 1 to close all fds */
                    const char *cwd,          /* working directory for program */
-                   struct child_info *ci_out, /* set on success! */
+                   struct proc *proc,        /* populated on success! */
                    FILE *pipe_ends_out[3],   /* pipe ends are put here */
                    char errmsg_out[],        /* written to on failure */
                    size_t errmsg_len         /* length of errmsg_out (EXCLUDING sentinel) */
@@ -438,7 +482,8 @@ child_failure:
     close(errpipe[0]);
 
     /* Child is now running */
-    ci_out->pid = pid;
+    proc->done = 0;
+    proc->pid = pid;
     return 0;
 }
 #elif defined(OS_WINDOWS)
@@ -615,6 +660,7 @@ failure:
     CloseHandle(pi.hThread); /* Don't want this handle */
     free(cmdline);
     closefds(hfiles, 3); /* XXX: is this correct? */
+    ci_out->done = 0;
     ci_out->pid = pi.dwProcessId;
     ci_out->hProcess = pi.hProcess;
     return 0;
@@ -624,7 +670,7 @@ failure:
 /* popen {arg0, arg1, arg2, ..., [executable=...]} */
 static int superpopen(lua_State *L)
 {
-    struct child_info *cip;
+    struct proc *proc = NULL;
 
     /* List of arguments (malloc'd NULL-terminated array of malloc'd C strings) */
     int nargs = 0;
@@ -645,7 +691,10 @@ static int superpopen(lua_State *L)
 
     char errmsg_buf[256];
 
-    struct child_info ci;
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_settop(L, 1);
+
+    proc = newproc(L);
     
     /* get arguments */
     nargs = lua_objlen(L, 1);
@@ -753,7 +802,7 @@ files_failure:
         lua_pop(L, 1);
     }
 
-    result = dopopen(args, executable, fdinfo, close_fds, cwd, &ci, pipe_ends, errmsg_buf, 255);
+    result = dopopen(args, executable, fdinfo, close_fds, cwd, proc, pipe_ends, errmsg_buf, 255);
     for (i=0; i<3; ++i)
         if (fdinfo[i].mode == FDMODE_FILENAME)
             free(fdinfo[i].info.filename);
@@ -765,84 +814,123 @@ files_failure:
         return luaL_error(L, "popen failed: %s", errmsg_buf);
     }
 
-    /* Create popen object: it has two parts, the table part and the userdata part. */
-    /* Create table for subprocess info */
-    lua_createtable(L, 0, 2);
-    luaL_getmetatable(L, SUBPROCESS_META);
-    lua_setmetatable(L, -2);
-    /* Create userdata */
-    cip = lua_newuserdata(L, sizeof(struct child_info));
-    luaL_getmetatable(L, SUBPROCESS_CI_META);
-    lua_setmetatable(L, -2);
-    *cip = ci;
-    cip->done = 0;
-    /* Put userdata in table */
-    lua_setfield(L, -2, "_child_info");
-    /* Set pid */
-    lua_pushinteger(L, ci.pid);
-    lua_setfield(L, -2, "pid");
-    /* Set pipe objects */
+    /* Put pipe object's in proc userdata's environment */
+    lua_getfenv(L, 2);
     for (i=0; i<3; ++i){
         if (pipe_ends[i]){
             *liolib_copy_newfile(L) = pipe_ends[i];
             lua_setfield(L, -2, fd_names[i]);
         }
     }
-    /* Return the table */
+    lua_pop(L, 1);
+
+    /* Put proc object in SP_LIST table */
+    lua_rawgeti(L, LUA_ENVIRONINDEX, SP_LIST);
+    if (lua_isnil(L, -1)){
+        fputs("subprocess.c: XXX: SP_LIST IS NIL\n", stderr);
+    } else {
+        lua_pushinteger(L, proc->pid); /* stack: proc list pid */
+        lua_pushvalue(L, -3);          /* stack: proc list pid proc */
+        lua_settable(L, -3);           /* stack: proc list */
+    }
+    lua_pop(L, 1);
+        
+    /* Return the proc */
     return 1;
 }
 
-/* Make sure first value on stack is a subprocess object
-   and return pointer to the child_info */
-static struct child_info *checksp(lua_State *L)
+/* __gc */
+static int proc_gc(lua_State *L)
 {
-    struct child_info *ci;
-    luaL_checktype(L, 1, LUA_TTABLE);
-    lua_getfield(L, 1, "_child_info");
-    ci = luaL_checkudata(L, -1, SUBPROCESS_CI_META);
-    lua_pop(L, 1);
-    return ci;
-}
-
-static int spu_gc(lua_State *L)
-{
-    struct child_info *ci = luaL_checkudata(L, 1, SUBPROCESS_CI_META);
-    if (!ci->done){
+    struct proc *proc = checkproc(L, 1);
+    if (!proc->done){
 #if defined(OS_POSIX)
         /* Try to wait for process to avoid leaving zombie.
            If the process hasn't finished yet, we'll end up leaving a zombie. */
         int stat;
-        waitpid(ci->pid, &stat, WNOHANG);
+        waitpid(proc->pid, &stat, WNOHANG);
 #elif defined(OS_WINDOWS)
-        CloseHandle(ci->hProcess);
+        CloseHandle(proc->hProcess);
 #endif
-        ci->done = 1; /* just in case */
+        doneproc(L, 1);
     }
     return 0;
 }
 
-/* Push string representation of process on stack */
-static int sp_tostring(lua_State *L)
+/* __index */
+static int proc_index(lua_State *L)
 {
-    struct child_info *ci = checksp(L);
-    lua_pushfstring(L, "subprocess (%d)", (int) ci->pid);
+    struct proc *proc;
+    const char *s;
+    lua_settop(L, 2);
+    proc = checkproc(L, 1);
+    /* first check environment table */
+    lua_getfenv(L, 1);
+    lua_pushvalue(L, 2);
+    lua_gettable(L, 3);
+    if (!lua_isnil(L, 4)) return 1;
+    lua_pop(L, 2);
+    /* next check metatable */
+    lua_getmetatable(L, 1);
+    lua_pushvalue(L, 2);
+    lua_gettable(L, 3);
+    if (!lua_isnil(L, 4)) return 1;
+    lua_pop(L, 2);
+    /* lastly, fixed fields */
+    s = lua_tostring(L, 2);
+    if (!strcmp(s, "pid")){
+        lua_pushinteger(L, proc->pid);
+        return 1;
+    } else if (!strcmp(s, "exitcode") && proc->done){
+        lua_pushinteger(L, proc->exitcode);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+/* Push string representation of process on stack */
+static int proc_tostring(lua_State *L)
+{
+    struct proc *proc = checkproc(L, 1);
+    if (proc->done)
+        lua_pushliteral(L, "(finished process)");
+    else
+        lua_pushfstring(L, "process (%d)", (int) proc->pid);
     return 1;
 }
 
+#if defined(OS_POSIX)
+/* Get exitcode from wait's 'stat' value */
+static int getexitcode(int stat)
+{
+    if (WIFEXITED(stat))
+        return WEXITSTATUS(stat);
+    else if (WIFSIGNALED(stat))
+        return -WTERMSIG(stat);
+    else if (WIFSTOPPED(stat))
+        return -WSTOPSIG(stat);
+    else {
+        fputs("child disappeared into black hole\n", stderr);
+        return -1;
+    }
+}
+#endif
+
 /* Wait for, or poll, a process */
-static int sp_waitpid(lua_State *L, struct child_info *ci, int wait)
+static int do_waitpid(lua_State *L, struct proc *proc, int wait)
 #if defined(OS_POSIX)
 {
     int stat, options;
 
-    if (ci->done){
-        lua_pushinteger(L, ci->exitcode);
+    if (proc->done){
+        lua_pushinteger(L, proc->exitcode);
         return 1;
     }
 
     if (wait) options = 0;
     else options = WNOHANG;
-    switch (waitpid(ci->pid, &stat, options)){
+    switch (waitpid(proc->pid, &stat, options)){
         case -1:
             return luaL_error(L, strerror(errno));
         case 0:
@@ -850,44 +938,23 @@ static int sp_waitpid(lua_State *L, struct child_info *ci, int wait)
             lua_pushnil(L);
             return 1;
         default:
-            if (WIFEXITED(stat)){
-                /* child terminated */
-                ci->exitcode = WEXITSTATUS(stat);
-doret:
-                ci->done = 1;
-                lua_pushinteger(L, ci->exitcode);
-                lua_pushvalue(L, -1);
-                lua_setfield(L, -3, "exitcode");
-                return 1;
-            } else if (WIFSIGNALED(stat)){
-                /* child died on a signal */
-                ci->exitcode = -WTERMSIG(stat);
-                goto doret;
-            } else if (WIFSTOPPED(stat)){
-                ci->exitcode = -WSTOPSIG(stat);
-                goto doret;
-            } else {
-                /* ??? */
-                ci->exitcode = 1;
-                ci->done = 1;
-                lua_pushliteral(L, "disappeared into black hole");
-                lua_pushvalue(L, -1);
-                lua_setfield(L, -3, "exitcode");
-                return 1;
-            }
+            proc->exitcode = getexitcode(stat);
+            doneproc(L, 1);
+            lua_pushinteger(L, proc->exitcode);
+            return 1;
     }
 }
 #elif defined(OS_WINDOWS)
 {
     DWORD dwMilliseconds, retval, exitcode;
 
-    if (ci->done){
-        lua_pushinteger(L, ci->exitcode);
+    if (proc->done){
+        lua_pushinteger(L, proc->exitcode);
         return 1;
     }
     if (wait) dwMilliseconds = INFINITE;
     else dwMilliseconds = 0;
-    retval = WaitForSingleObject(ci->hProcess, dwMilliseconds);
+    retval = WaitForSingleObject(proc->hProcess, dwMilliseconds);
     switch (retval){
         case WAIT_FAILED:
 failure:
@@ -895,15 +962,13 @@ failure:
             return lua_error(L);
         case WAIT_OBJECT_0:
             /* child finished */
-            if (GetExitCodeProcess(ci->hProcess, &exitcode) == 0){
+            if (GetExitCodeProcess(proc->hProcess, &exitcode) == 0){
                 goto failure;
             }
-            CloseHandle(ci->hProcess);
-            ci->exitcode = exitcode;
-            ci->done = 1;
-            lua_pushinteger(L, ci->exitcode);
-            lua_pushvalue(L, -1);
-            lua_setfield(L, -3, "exitcode");
+            CloseHandle(proc->hProcess);
+            proc->exitcode = exitcode;
+            doneproc(L, 1);
+            lua_pushinteger(L, proc->exitcode);
             return 1;
         case WAIT_TIMEOUT:
         default:
@@ -914,76 +979,74 @@ failure:
 }
 #endif
 
-static int sp_poll(lua_State *L)
+static int proc_poll(lua_State *L)
 {
-    return sp_waitpid(L, checksp(L), 0);
+    return do_waitpid(L, checkproc(L, 1), 0);
 }
 
-static int sp_wait(lua_State *L)
+static int proc_wait(lua_State *L)
 {
-    return sp_waitpid(L, checksp(L), 1);
+    return do_waitpid(L, checkproc(L, 1), 1);
 }
 
 #if defined(OS_POSIX)
-static int sp_send_signal(lua_State *L)
+static int proc_send_signal(lua_State *L)
 {
-    struct child_info *ci = checksp(L);
+    struct proc *proc = checkproc(L, 1);
     int sig = luaL_checkint(L, 2);
-    if (!ci->done){
-        if (kill(ci->pid, sig)){
+    if (!proc->done){
+        if (kill(proc->pid, sig)){
             return luaL_error(L, "kill: %s", strerror(errno));
         }
-        ci->done = 1;
-        ci->exitcode = -sig;
-        lua_pushvalue(L, 1);
-        lua_pushinteger(L, -sig);
-        lua_setfield(L, -2, "exitcode");
-        lua_pop(L, 1);
+        proc->exitcode = -sig;
+        doneproc(L, 1);
     }
     return 0;
 }
 
-static int sp_terminate(lua_State *L)
+static int proc_terminate(lua_State *L)
 {
     lua_settop(L, 1);
     lua_pushinteger(L, SIGTERM);
-    return sp_send_signal(L);
+    return proc_send_signal(L);
 }
 
-static int sp_kill(lua_State *L)
+static int proc_kill(lua_State *L)
 {
     lua_settop(L, 1);
     lua_pushinteger(L, SIGKILL);
-    return sp_send_signal(L);
+    return proc_send_signal(L);
 }
 #elif defined(OS_WINDOWS)
 static int sp_terminate(lua_State *L)
 {
-    struct child_info *ci = checksp(L);
-    if (!ci->done){
-        if (TerminateProcess(ci->hProcess, -9) == 0){
+    struct proc *proc = checkproc(L, 1);
+    if (!proc->done){
+        if (TerminateProcess(proc->hProcess, -9) == 0){
             push_w32error(L, GetLastError());
             return lua_error(L);
         }
-        CloseHandle(ci->hProcess);
-        ci->exitcode = -9;
-        ci->done = 1;
+        CloseHandle(proc->hProcess);
+        proc->exitcode = -9;
+        doneproc(L, 1);
     }
     return 0;
 }
 #endif
 
-static const luaL_Reg subprocess_meta[] = {
-    {"__tostring", sp_tostring},
-    {"poll", sp_poll},
-    {"wait", sp_wait},
+static const luaL_Reg proc_meta[] = {
+    {"__tostring", proc_tostring},
+    {"__gc", proc_gc},
+    {"__index", proc_index},
+    {"poll", proc_poll},
+    {"wait", proc_wait},
 #if defined(OS_POSIX)
-    {"send_signal", sp_send_signal},
-    {"terminate", sp_terminate},
-    {"kill", sp_kill},
+    {"send_signal", proc_send_signal},
+    {"terminate", proc_terminate},
+    {"kill", proc_kill},
 #elif defined(OS_WINDOWS)
-    {"terminate", sp_terminate},
-    {"kill", sp_terminate},
+    {"terminate", proc_terminate},
+    {"kill", proc_terminate},
 #endif
     {NULL, NULL}
 };
@@ -995,7 +1058,7 @@ static int call(lua_State *L)
     if (r != 1){
         return r;
     }
-    return sp_wait(L);
+    return proc_wait(L);
 }
 
 static int call_capture(lua_State *L)
@@ -1036,68 +1099,159 @@ static int call_capture(lua_State *L)
 
 /* Miscellaneous */
 
-#if 0
 static int superwait(lua_State *L)
 {
     int stat;
-    pid_t pid = wait(&stat);
-    if (pid == -1) return luaL_error(L, strerror(errno));
-    lua_pushinteger(L, pid);
-    if (WIFEXITED(stat)){
-        /* child terminated */
-        lua_pushinteger(L, WEXITSTATUS(stat));
-    } else if (WIFSIGNALED(stat)){
-        /* child died on a signal */
-        lua_pushinteger(L, -WTERMSIG(stat));
-    } else if (WIFSTOPPED(stat)){
-        lua_pushinteger(L, -WSTOPSIG(stat));
-    } else {
-        /* ??? */
-        lua_pushliteral(L, "disappeared into black hole");
-    }
-    return 2;
-}
+    int exitcode;
+    struct proc *proc;
+#if defined(OS_POSIX)
+    pid_t pid;
+#elif defined(OS_WINDOWS)
+    HANDLE *handles, hProcess;
+    int i, nprocs;
+    DWORD retval;
+    DWORD exitcode;
 #endif
+
+    lua_rawgeti(L, LUA_ENVIRONINDEX, SP_LIST);
+    if (lua_isnil(L, -1))
+        return luaL_error(L, "SP_LIST is nil");
+#if defined(OS_POSIX)
+    pid = wait(&stat);
+    if (pid == -1){
+        lua_pushnil(L);
+        lua_pushstring(L, strerror(errno));
+        return 2;
+    }
+    exitcode = getexitcode(stat);
+    /* find proc object corresponding to pid */
+    lua_pushinteger(L, pid);
+    lua_pushvalue(L, -1);    /* stack: list pid pid */
+    lua_gettable(L, -3);     /* stack: list pid proc */
+    if (lua_isnil(L, -1)){
+        fprintf(stderr, "subprocess.c: XXX: cannot find proc object for pid %d\n", (int) pid);
+    }
+    lua_replace(L, -3);     /* stack: proc pid */
+    lua_pop(L, 1);          /* stack: proc */
+    /* update proc object */
+    proc = toproc(L, -1);
+    if (!proc){
+        fputs("subprocess.c: XXX: proc list entry is wrong type\n", stderr);
+    } else {
+        proc->exitcode = exitcode;
+        doneproc(L, -1);
+    }
+    lua_pushinteger(L, exitcode);
+    lua_pushinteger(L, pid);
+    /* stack: proc exitcode pid */
+    return 3;
+#elif defined(OS_WINDOWS)
+    /* count number of procs there are */
+    nprocs = countkeys(L);
+    /* stack: list */
+    if (nprocs > 0){
+        handles = malloc(nprocs * sizeof *handles);
+        if (!handles)
+            return luaL_error(L, "memory full");
+        i = 0;
+        lua_pushnil(L);
+        while (lua_next(L, -2)){
+            proc = toproc(L, -1);
+            if (proc && !proc->done && i < nprocs){
+                handles[i++] = proc->hProcess;
+            } else if (proc && !proc->done){
+                fputs("subprocess.c: XXX: handles array allocated too small\n", stderr);
+            } else if (!proc){
+                fputs("foreign object in SP_LIST\n", stderr);
+            }
+            lua_pop(L, 1);
+        }
+    } else i = 0;
+    if (i > 0){
+        if (i > MAXIMUM_WAIT_OBJECTS){
+            free(handles);
+            return luaL_error("too many wait objects: %d", i);
+        }
+        retval = WaitForMultipleObjects(i, handles, FALSE, INFINITE);
+        if (retval >= WAIT_OBJECT_0 && retval < WAIT_OBJECT_0 + i){
+            hProcess = handles[retval - WAIT_OBJECT_0];
+            free(handles);
+            /* find this process again in the table */
+            lua_pushnil(L);
+            while (lua_next(L, -2)){
+                proc = toproc(L, -1);
+                if (proc && !proc->done && proc->hProcess == hProcess){
+                    /* it's this one */
+                    if (GetExitCodeProcess(proc->hProcess, &exitcode) == 0){
+                        {
+                            char buf[256];
+                            copy_w32error(buf, 255, GetLastError());
+                            fprintf(stderr, "GetExitCodeProcess failed: %s\n", buf);
+                        }
+                        proc->exitcode = -1; /*  :-\  */
+                    } else {
+                        proc->exitcode = exitcode;
+                    }
+                    CloseHandle(proc->hProcess);
+                    doneproc(L, -1);
+                    lua_pushinteger(L, exitcode);
+                    lua_pushinteger(L, proc->pid); /* stack: list key proc exitcode pid */
+                    return 3;
+                }
+                lua_pop(L, 1);
+            }
+            fputs("proc has mysteriously disappeared from table!\n", stderr);
+            return 0;
+        } else if (retval == WAIT_FAILED){
+            free(handles);
+            push_w32error(L, GetLastError());
+            return lua_error(L);
+        } else {
+            free(handles);
+            return luaL_error("WaitForMultipleObjects failed unexpectedly");
+        }
+    } else {
+        free(handles);
+        lua_pushnil(L);
+        lua_pushliteral(L, "no processes to wait for");
+        return 2;
+    }
+#endif
+}
 
 static const luaL_Reg subprocess[] = {
     /* {"pipe", superpipe}, */
     {"popen", superpopen},
     {"call", call},
     {"call_capture", call_capture},
-    /* {"wait", superwait}, */
+    {"wait", superwait},
     {NULL, NULL}
 };
 
 LUALIB_API int luaopen_subprocess(lua_State *L)
 {
+    /* create environment table for C functions */
+    lua_createtable(L, 1, 0);
+    lua_newtable(L);   /* table for all proc objects */
+    lua_rawseti(L, -2, SP_LIST);
+    lua_replace(L, LUA_ENVIRONINDEX);
+
     luaL_register(L, "subprocess", subprocess);
+
+    /* export PIPE and STDOUT constants */
     lua_pushlightuserdata(L, &PIPE);
     lua_setfield(L, -2, "PIPE");
     lua_pushlightuserdata(L, &STDOUT);
     lua_setfield(L, -2, "STDOUT");
-    
-    /* create environment for pipes */
-    /*lua_createtable(L, 0, 1);
-    lua_pushcfunction(L, close_pipe);
-    lua_setfield(L, -2, "__close");
-    lua_setfield(L, LUA_REGISTRYINDEX, PIPE_ENV);*/
 
-    /* create metatable for subprocesses' userdata */
-    luaL_newmetatable(L, SUBPROCESS_CI_META);
+    /* create metatable for proc objects */
+    luaL_newmetatable(L, SP_PROC_META);
+    luaL_register(L, NULL, proc_meta);
     lua_pushboolean(L, 0);
     lua_setfield(L, -2, "__metatable");
-    lua_pushcfunction(L, spu_gc);
-    lua_setfield(L, -2, "__gc");
-    lua_pop(L, 1);
-
-    /* create metatable for subprocesses */
-    luaL_newmetatable(L, SUBPROCESS_META);
-    lua_pushvalue(L, -1);
-    lua_setfield(L, -2, "__index");
-    lua_pushnil(L);
-    lua_setfield(L, -2, "__metatable");
-    luaL_register(L, NULL, subprocess_meta);
     lua_pop(L, 1);
 
     return 1;
 }
+
+#endif

@@ -312,6 +312,7 @@ static int io_fclose(lua_State *L)
 FILE *liolib_copy_tofile(lua_State *L, int index)
 {
     int eq;
+    if (lua_type(L, index) != LUA_TTABLE) return NULL;
     lua_getmetatable(L, index);
     luaL_getmetatable(L, LUA_FILEHANDLE);
     eq = lua_equal(L, -2, -1);
