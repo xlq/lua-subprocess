@@ -868,7 +868,6 @@ files_failure:
 static int proc_gc(lua_State *L)
 {
     struct proc *proc = checkproc(L, 1);
-    puts("proc_gc");
     if (!proc->done){
 #if defined(OS_POSIX)
         /* Try to wait for process to avoid leaving zombie.
