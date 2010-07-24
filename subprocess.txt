@@ -1,19 +1,19 @@
-subprocess module
-=================
+lua-subprocess
+==============
 
 == Introduction
 
-The subprocess module allows you to create child processes and
+`lua-subprocess` is a Lua module that allows you to create child processes and
 communicate with them. The API is based on Python's subprocess
 module, but is not yet as complete.
 
 == Compatibility
 
-Works on Linux. Needs much more testing. Doesn't support Windows at all.
+Tested under Windows, Linux and Wine. Needs more testing.
 
 == Functions
 
-=== `subprocess.popen { arg1, arg2, ..., [options...] }`
+==== subprocess.popen { arg1, arg2, ..., [options...] }
 Creates a child process with the arguments arg1, arg2 etc. Options
 are table items with string keys. The valid options are:
 
@@ -26,31 +26,38 @@ are table items with string keys. The valid options are:
     Each of these options can have the following types:
         ** `string` - the option specifies a filename that is opened
         for reading (for stdin) or for writing (for stdout or stderr).
-        ** `number` - specifies a file descriptor to use. The file
-        descriptor is not closed in the parent process.
-    The following values can also be used:
+        ** `number` - specifies an open file to use. The file
+        is not closed by popen in the parent process.
+        In POSIX, this value is a file descriptor.
+        In Windows, this value is a Windows API handle.
+        ** `FILE*` - a Lua file object can be used. This file is not
+        closed by popen in the parent process.
+    The following constants can also be used:
         ** `subprocess.PIPE` - a pipe is created, and the relevant end
         is given to the child process. A Lua file object is placed in
-        the returned subprocess object with the name `stdin`,
-        `stdout` or `stderr`.
+        the returned proc object. For stdin, the read end is given to
+        the child process and stdin is set to a writable file in the proc
+        object. For stdout or stderr, the write end is given to the child
+        process and stdout/stderr is set to a readable file in the proc
+        object.
         ** `subprocess.STDOUT` (only for stderr) -
         This can be used to redirect the standard error file to the
         standard output.
     * `close_fds` _(boolean)_ If true, all file descriptors (except
     standard input, output and error) are closed after forking, but
     before calling exec, so that the child process doesn't inherit these
-    file descriptors.
+    file descriptors. On Windows, this does nothing.
     * `cwd` _(string)_ Names a directory for the child process to be
     run in.
 `subprocess.popen` can throw Lua errors when something goes horribly
-wrong. For normal errors, however, it returns nil, an error message and
-sometimes the value of errno.
+wrong. For normal errors, however, it returns `nil, errormsg, errno` (errno
+may or may not be nil, depending on the nature of the error).
 
 ===== Return value
-On success, returns a subprocess object (see <<subprocessobj,below>>).
-On failure, returns `nil, errmsg, errno`.
+On success, returns a proc object (see <<procobj,below>>).
+On failure, returns `nil, errormsg, errno`.
 
-=== `subprocess.call { arg1, arg2, ..., [options...] }`
+==== subprocess.call { arg1, arg2, ..., [options...] }
 Creates a child process in the same way as `subprocess.popen` but waits
 for the child to finish executing, then sets and returns the `exitcode`.
 
@@ -59,9 +66,9 @@ when calling `subprocess.call`, as it will deadlock when a pipe buffer
 is filled.
 
 ===== Return value
-Returns `exitcode`. See: <<exitcode>>.
+Returns `exitcode`. See: <<exitcode,exitcode>>.
 
-=== `subprocess.call_capture { arg1, arg2, ..., [options...] }`
+==== subprocess.call_capture { arg1, arg2, ..., [options...] }
 Creates a child process in the same way as `subprocess.popen` but reads
 all data from the child's standard output and returns it. If you want to
 capture stderr as well, set `stderr` to `subprocess.STDOUT`.
@@ -75,59 +82,67 @@ exhausted.
 ===== Return value
 Returns `exitcode, content` where `content` is a string containing the captured output.
 
-=== `subprocess.wait()`
+==== subprocess.wait()
 Waits for any child process to exit.
 
 ===== Return value
-Returns `pid, exitcode`.
+On success, returns `proc, exitcode, pid`. I'm not sure why you'd want the
+pid after the process has finished, though.
 
-WARNING: no subprocess objects will have their `exitcode` set, and if there is
-a corresponding subprocess object, its `wait` or `poll` methods must *not* be called
-after the call to `subprocess.wait`.
+On failure, returns `nil, errormsg`.
 
-[[subprocessobj]]
-== Subprocess objects
+WARNING: On POSIX operating systems, `subprocess.wait` calls the `wait` system
+function. If you create child processes without using the subprocess module,
+and the `wait` system call returns a pid without a corresponding proc object,
+then the returned proc object will be `nil`.
+Furthermore, the process will be removed from the process table and the `waitpid`
+system call should not be used for that pid again.
 
-=== `child.pid`
+[[procobj]]
+== Proc objects
+
+==== proc.pid
 This is set to the process identifier of the child.
 
-=== `child._subprocess`
-Pretend it wasn't there.
+WARNING: On POSIX systems, do not use this value with the `waitpid` system
+call, because you will make the subprocess module use an invalid pid
+in future system calls. In fact, the `wait` system call will have this effect
+too, so don't use it while subprocess's child processes are running.
 
-=== `child.stdin`, `child.stdout`, `child.stderr`
+==== proc.stdin, proc.stdout, proc.stderr
 These are set to file objects if the corresponding option passed to
 `subprocess.popen`, was set to `subprocess.PIPE`. Note that if
 the `stderr` option was set to `subprocess.STDOUT`,
-`child.stderr` will not be set.
+`proc.stderr` will not be set.
 
 [[exitcode]]
-=== `child.exitcode`
-After `child:poll` or `child:wait` discovers the child process has
-terminated, this field is set to the exit code of the child process.
-If `child.exitcode < 0` then the child was killed by signal number 
-`-child.exitcode`.
+==== proc.exitcode
+After `proc:poll`, `proc:wait` or `subprocess.wait` discovers the child process has
+terminated, this field is set to the exit code of the child process. Before then,
+it is `nil`.
+If `proc.exitcode < 0` then the child was killed by signal number 
+`-proc.exitcode`.
 
-=== `child:poll()`
-Check if the child process hs terminated, and sets the `exitcode` field.
+==== proc:poll()
+Checks if the child process has terminated. If the child process has terminated,
+this sets `proc.exitcode` and returns it. If the child process is still running,
+this returns `nil`.
 
-===== Return value
-If the child process has terminated, `child.exitcode` is returned.
-Otherwise `nil` is returned.
-
-=== `child:wait()`
-Wait for the child process to terminate, then set and return the
+==== proc:wait()
+Waits for the child process to terminate, then sets and returns the
 `exitcode` field.
 
-=== `child:send_signal(sig)`
-Send a signal to the child process.
+==== proc:send_signal(sig) _(POSIX only)_
+Sends a signal to the child process.
 
-=== `child:terminate()`
-Terminates the child process. On UNIX, sends `SIGTERM`.
+==== proc:terminate()
+Terminates the child process. On POSIX, itsends `SIGTERM`. On Windows,
+it calls TerminateProcess.
 
-=== `child:kill()`
-Kills the child process. On UNIX, sends `SIGKILL`.
+==== proc:kill()
+Kills the child process. On POSIX, it sends `SIGKILL`. On Windows, it
+is the same as `proc:terminate()`.
 
 == TODO ==
-* Use a `__gc` function to make sure a zombie process isn't left behind.
 * Support of other operating systems.
 * Deadlock-free way of communicating.

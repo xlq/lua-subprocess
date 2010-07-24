@@ -81,7 +81,13 @@ struct proc {
 #define SP_PROC_META "subprocess_proc*"
 
 /* Environment keys */
-#define SP_LIST 1                                    /* table of [pid]=proc */
+/* This is an integer index into the environment of C functions in this module.
+   At this index is stored a table of [pid]=proc items. The items in this table
+   will all have their `done` fields set to false. This table is at present only
+   used for the `subprocess.wait` function.
+   On POSIX, it is used to get the proc object corresponding to a pid. On
+   Windows, it is used to assemble a HANDLE array for WaitForMultipleObjects. */
+#define SP_LIST 1
 
 /* Function to count number of keys in a table.
    Table must be at top of stack. */
