@@ -794,7 +794,7 @@ strings_failure:
         } else if (lua_touserdata(L, -1) == &PIPE){
             fdinfo[i].mode = FDMODE_PIPE;
         } else if (lua_touserdata(L, -1) == &STDOUT){
-            if (i == STDERR_FILENO && fdinfo[STDOUT_FILENO].mode == FDMODE_PIPE){
+            if (i == STDERR_FILENO /*&& fdinfo[STDOUT_FILENO].mode == FDMODE_PIPE*/){
                 fdinfo[i].mode = FDMODE_STDOUT;
             } else {
                 lua_pushliteral(L, "STDOUT must be used only for stderr when stdout is set to PIPE");
