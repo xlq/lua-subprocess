@@ -42,7 +42,8 @@ are table items with string keys. The valid options are:
         object.
         ** `subprocess.STDOUT` (only for stderr) -
         This can be used to redirect the standard error file to the
-        standard output.
+        standard output. This is useful if a pipe is used for stdout,
+        or for outputting both stdout and stderr to the same regular file.
     * `close_fds` _(boolean)_ If true, all file descriptors (except
     standard input, output and error) are closed after forking, but
     before calling exec, so that the child process doesn't inherit these

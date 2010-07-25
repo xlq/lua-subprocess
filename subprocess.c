@@ -819,7 +819,7 @@ strings_failure:
             if (i == STDERR_FILENO /*&& fdinfo[STDOUT_FILENO].mode == FDMODE_PIPE*/){
                 fdinfo[i].mode = FDMODE_STDOUT;
             } else {
-                lua_pushliteral(L, "STDOUT must be used only for stderr when stdout is set to PIPE");
+                lua_pushliteral(L, "STDOUT must be used only for stderr"/* when stdout is set to PIPE"*/);
 files_failure:
                 /*for (j=0; j<i; ++j){
                     if (fdinfo[j].mode == FDMODE_FILENAME)
