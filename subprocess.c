@@ -407,9 +407,9 @@ fd_failure:
                 break;
             case FDMODE_FILENAME:
                 if (i == STDIN_FILENO){
-                    if ((fds[i] = creat(fdi->info.filename, 0666)) == -1) goto fd_failure;
-                } else {
                     if ((fds[i] = open(fdi->info.filename, O_RDONLY)) == -1) goto fd_failure;
+                } else {
+                    if ((fds[i] = creat(fdi->info.filename, 0666)) == -1) goto fd_failure;
                 }
                 break;
             case FDMODE_FILEDES:
