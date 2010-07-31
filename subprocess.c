@@ -366,6 +366,7 @@ static int dopopen(char *const *args,        /* program arguments with NULL sent
                    const char *executable,   /* actual executable */
                    struct fdinfo fdinfo[3],  /* info for stdin/stdout/stderr */
                    int close_fds,            /* 1 to close all fds */
+                   int binary,               /* 1 to use binary files */
                    const char *cwd,          /* working directory for program */
                    struct proc *proc,        /* populated on success! */
                    FILE *pipe_ends_out[3],   /* pipe ends are put here */
@@ -610,7 +611,7 @@ failure:
                     goto fd_failure;
                 if (i == STDIN_FILENO){
                     hfiles[i] = piper;
-                    fd = _open_osfhandle((intptr_t) pipew, 0);
+                    fd = _open_osfhandle((intptr_t) pipew, binary ? 0 : _O_TEXT);
                     if (fd == -1){
                         strncpy(errmsg_out, "_open_osfhandle failed", errmsg_len + 1);
                         goto failure;
@@ -622,7 +623,7 @@ failure:
                     }
                 } else {
                     hfiles[i] = pipew;
-                    fd = _open_osfhandle((intptr_t) piper, _O_RDONLY);
+                    fd = _open_osfhandle((intptr_t) piper, _O_RDONLY | (binary ? 0 : _O_TEXT));
                     if (fd == -1){
                         strncpy(errmsg_out, "_open_osfhandle failed", errmsg_len + 1);
                         goto failure;
@@ -712,6 +713,8 @@ static int superpopen(lua_State *L)
     struct fdinfo fdinfo[3];
     /* Close fds? */
     int close_fds = 0;
+    /* Use binary mode for files? */
+    int binary = 0;
 
     FILE *pipe_ends[3] = {NULL, NULL, NULL};
     int i, j, result;
@@ -786,6 +789,11 @@ strings_failure:
     close_fds = lua_toboolean(L, -1);
     lua_pop(L, 1);
 
+    /* binary */
+    lua_getfield(L, 1, "binary");
+    binary = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+
     /* handle stdin/stdout/stderr */
     for (i=0; i<3; ++i){
         lua_getfield(L, 1, fd_names[i]);
@@ -833,7 +841,7 @@ files_failure:
         lua_pop(L, 1);
     }
 
-    result = dopopen(args, executable, fdinfo, close_fds, cwd, proc, pipe_ends, errmsg_buf, 255);
+    result = dopopen(args, executable, fdinfo, close_fds, binary, cwd, proc, pipe_ends, errmsg_buf, 255);
     for (i=0; i<3; ++i)
         if (fdinfo[i].mode == FDMODE_FILENAME)
             free(fdinfo[i].info.filename);

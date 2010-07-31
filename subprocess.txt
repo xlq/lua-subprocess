@@ -47,6 +47,8 @@ are table items with string keys. The valid options are:
     standard input, output and error) are closed after forking, but
     before calling exec, so that the child process doesn't inherit these
     file descriptors. On Windows, this does nothing.
+    * `binary` _(boolean)_ If true, binary mode is used for files returned
+    to the caller. This disables CR/LF translation. On POSIX, this does nothing.
     * `cwd` _(string)_ Names a directory for the child process to be
     run in.
 `subprocess.popen` can throw Lua errors when something goes horribly
