@@ -644,9 +644,9 @@ failure:
     }
 
     /* Find executable name */
-    if (!executable){
+    if (executable == NULL){
         /* use first arg */
-        executable = args[0];
+        /*executable = args[0];*/
     }
 
     /* Compile command line into string. Yuck. */
