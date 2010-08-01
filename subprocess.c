@@ -871,7 +871,7 @@ files_failure:
         return luaL_error(L, "popen failed: %s", errmsg_buf);
     }
 
-    /* Put pipe object's in proc userdata's environment */
+    /* Put pipe objects in proc userdata's environment */
     lua_getfenv(L, 2);
     for (i=0; i<3; ++i){
         if (pipe_ends[i]){
@@ -886,9 +886,9 @@ files_failure:
     if (lua_isnil(L, -1)){
         fputs("subprocess.c: XXX: SP_LIST IS NIL\n", stderr);
     } else {
-        lua_pushinteger(L, proc->pid); /* stack: proc list pid */
-        lua_pushvalue(L, -3);          /* stack: proc list pid proc */
-        lua_settable(L, -3);           /* stack: proc list */
+        lua_pushinteger(L, proc->pid); /* stack: list pid */
+        lua_pushvalue(L, 2);           /* stack: list pid proc */
+        lua_settable(L, -3);           /* stack: list */
     }
     lua_pop(L, 1);
         
