@@ -674,7 +674,7 @@ failure:
         cmdline,    /* lpCommandLine */
         NULL,       /* lpProcessAttributes */
         NULL,       /* lpThreadAttributes */
-        FALSE,      /* bInheritHandles */
+        TRUE,       /* bInheritHandles */
         0,          /* dwCreationFlags */
         NULL,       /* lpEnvironment */
         cwd,        /* lpCurrentDirectory */
