@@ -208,7 +208,7 @@ struct fdinfo {
         FDMODE_STDOUT        /* redirect to stdout (only for stderr) */
     } mode;
     union {
-        char *filename;
+        const char *filename;
         filedes_t filedes;
         FILE *fileobj;
     } info;
@@ -328,13 +328,13 @@ static int str_appendc(struct str *s, char ch)
 }
 
 /* Compiles command line for CreateProcess. Returns malloc'd string. */
-static char *compile_cmdline(char *const *args)
+static char *compile_cmdline(const char *const *args)
 {
     /*  "      --> \"
         \"     --> \\\"
         \<NUL> --> \\    */
     struct str str;
-    char *arg;
+    const char *arg;
     str_init(&str);
     while (*args != NULL){
         arg = *args++;
@@ -362,7 +362,7 @@ static char *compile_cmdline(char *const *args)
 
 /* Function for opening subprocesses. Returns 0 on success and -1 on failure.
    On failure, errmsg_out shall contain a '\0'-terminated error message. */
-static int dopopen(char *const *args,        /* program arguments with NULL sentinel */
+static int dopopen(const char *const *args,  /* program arguments with NULL sentinel */
                    const char *executable,   /* actual executable */
                    struct fdinfo fdinfo[3],  /* info for stdin/stdout/stderr */
                    int close_fds,            /* 1 to close all fds */
@@ -486,7 +486,7 @@ pipe_failure:
         if (cwd && chdir(cwd)) goto child_failure;
 
         /* exec! Farewell, subprocess.c! */
-        execvp(executable, args);
+        execvp(executable, (char *const*) args); /* XXX: const cast */
 
         /* Oh dear, we're still here. */
 child_failure:
@@ -657,6 +657,7 @@ failure:
         closefiles(pipe_ends_out, 3);
         return -1;
     }
+    
 
     si.cb = sizeof si;
     si.lpReserved = NULL;
@@ -702,13 +703,14 @@ static int superpopen(lua_State *L)
 {
     struct proc *proc = NULL;
 
-    /* List of arguments (malloc'd NULL-terminated array of malloc'd C strings) */
+    /* List of arguments (malloc'd NULL-terminated array of C strings.
+       The C strings are owned by Lua) */
     int nargs = 0;
-    char **args = NULL;
-    /* Command to run (malloc'd) */
-    char *executable = NULL;
-    /* Directory to run it in */
-    char *cwd = NULL;
+    const char **args = NULL;
+    /* Command to run (owned by Lua) */
+    const char *executable = NULL;
+    /* Directory to run it in (owned by Lua) */
+    const char *cwd = NULL;
     /* File options */
     struct fdinfo fdinfo[3];
     /* Close fds? */
@@ -717,7 +719,7 @@ static int superpopen(lua_State *L)
     int binary = 0;
 
     FILE *pipe_ends[3] = {NULL, NULL, NULL};
-    int i, j, result;
+    int i, result;
     FILE *f;
     const char *s;
 
@@ -729,60 +731,70 @@ static int superpopen(lua_State *L)
     lua_settop(L, 1);
 
     proc = newproc(L);
+
+    /* Stack: kwargs proc <strings etc....>
+       Lua strings are left on the stack while they are needed,
+       and Lua can garbage-collect them later. */
     
     /* get arguments */
     nargs = lua_objlen(L, 1);
     if (nargs == 0) return luaL_error(L, "no arguments specified");
-    args = malloc((nargs + 1) * sizeof *args);
+    args = lua_newuserdata(L, (nargs + 1) * sizeof *args); /*alloc((nargs + 1) * sizeof *args);*/
     if (!args) return luaL_error(L, "memory full");
     for (i=0; i<=nargs; ++i) args[i] = NULL;
+    luaL_checkstack(L, nargs, "cannot grow stack");
     for (i=1; i<=nargs; ++i){
         lua_rawgeti(L, 1, i);
         s = lua_tostring(L, -1);
         if (!s){
-            freestrings(args, nargs);
-            free(args);
+            /*freestrings(args, nargs);
+            free(args);*/
             return luaL_error(L, "popen argument %d not a string", (int) i);
 
         }
-        args[i-1] = strdup(s);
-        if (args[i-1] == NULL){
+        args[i-1] = s; /*strdup(s);*/
+        /*if (args[i-1] == NULL){
 strings_failure:
             freestrings(args, nargs);
             free(args);
             return luaL_error(L, "memory full");
-        }
-        lua_pop(L, 1);
+        } */
+        /*lua_pop(L, 1);*/
     }
+
+    luaL_checkstack(L, 12, "cannot grow stack");
     
     /* get executable string */
     lua_getfield(L, 1, "executable");
     s = lua_tostring(L, -1);
     if (s){
-        executable = strdup(s);
-        if (executable == NULL) goto strings_failure;
-    }
-    lua_pop(L, 1); /* to match lua_getfield */
+        executable = s; /*strdup(s);*/
+        /*if (executable == NULL) goto strings_failure;*/
+    } else lua_pop(L, 1);
+    /*lua_pop(L, 1); */ /* to match lua_getfield */
 
     /* get directory name */
     lua_getfield(L, 1, "cwd");
-    if (lua_isstring(L, -1)){
-        cwd = strdup(lua_tostring(L, -1));
+    cwd = lua_tostring(L, -1);
+    if (cwd == NULL) lua_pop(L, 1);
+    else {
+    /*if (lua_isstring(L, -1)){
+        cwd = lua_tostring(L, -1);*/ /*strdup(lua_tostring(L, -1));
         if (!cwd){
             free(executable);
             freestrings(args, nargs);
             free(args);
             return luaL_error(L, "memory full");
-        }
+        }                            */
         /* make sure the cwd exists */
         if (!direxists(cwd)){
-            free(executable);
-            freestrings(args, nargs);
-            free(args);
+            /*free(executable);
+            freestrings(args, nargs);*/
+            /*free(args);*/
             return luaL_error(L, "directory `%s' does not exist", cwd);
         }
     }
-    lua_pop(L, 1);
+    /*lua_pop(L, 1);*/
 
     /* close_fds */
     lua_getfield(L, 1, "close_fds");
@@ -799,34 +811,40 @@ strings_failure:
         lua_getfield(L, 1, fd_names[i]);
         if (lua_isnil(L, -1)){
             fdinfo[i].mode = FDMODE_INHERIT;
+            lua_pop(L, 1);
         } else if (lua_touserdata(L, -1) == &PIPE){
             fdinfo[i].mode = FDMODE_PIPE;
+            lua_pop(L, 1);
         } else if (lua_touserdata(L, -1) == &STDOUT){
             if (i == STDERR_FILENO /*&& fdinfo[STDOUT_FILENO].mode == FDMODE_PIPE*/){
                 fdinfo[i].mode = FDMODE_STDOUT;
             } else {
                 lua_pushliteral(L, "STDOUT must be used only for stderr when stdout is set to PIPE");
 files_failure:
-                for (j=0; j<i; ++j){
+                /*for (j=0; j<i; ++j){
                     if (fdinfo[j].mode == FDMODE_FILENAME)
                         free(fdinfo[j].info.filename);
                 }
                 free(executable);
                 freestrings(args, nargs);
-                free(args);
+                free(args);*/
                 return lua_error(L);
             }
+            lua_pop(L, 1);
         } else if (lua_isstring(L, -1)){
             /* open a file */
             fdinfo[i].mode = FDMODE_FILENAME;
-            if ((fdinfo[i].info.filename = strdup(lua_tostring(L, -1))) == NULL){
+            /*if ((fdinfo[i].info.filename = strdup(lua_tostring(L, -1))) == NULL){
                 lua_pushliteral(L, "out of memory");
                 goto files_failure;
-            }
+            } */
+            fdinfo[i].info.filename = lua_tostring(L, -1);
+            /* do not pop */
         } else if (lua_isnumber(L, -1)){
             /* use this fd */
             fdinfo[i].mode = FDMODE_FILEDES;
             fdinfo[i].info.filedes = (filedes_t) lua_tointeger(L, -1);
+            lua_pop(L, 1);
         } else {
             f = liolib_copy_tofile(L, -1);
             if (f){
@@ -837,17 +855,17 @@ files_failure:
                 lua_pushfstring(L, "unexpected value for %s", fd_names[i]);
                 goto files_failure;
             }
+            lua_pop(L, 1);
         }
-        lua_pop(L, 1);
     }
 
     result = dopopen(args, executable, fdinfo, close_fds, binary, cwd, proc, pipe_ends, errmsg_buf, 255);
-    for (i=0; i<3; ++i)
+    /*for (i=0; i<3; ++i)
         if (fdinfo[i].mode == FDMODE_FILENAME)
             free(fdinfo[i].info.filename);
     free(executable);
     freestrings(args, nargs);
-    free(args);
+    free(args);*/
     if (result == -1){
         /* failed */
         return luaL_error(L, "popen failed: %s", errmsg_buf);
@@ -875,6 +893,7 @@ files_failure:
     lua_pop(L, 1);
         
     /* Return the proc */
+    lua_settop(L, 2);
     return 1;
 }
 
