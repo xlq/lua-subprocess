@@ -11,6 +11,25 @@ module, but is not yet as complete.
 
 Tested under Windows, Linux and Wine. Needs more testing.
 
+== Building
+
+Building lua-subprocess without the makefile is very simple. All you
+need to do is compile subprocess.c and liolib-copy.c into a shared
+object, linked against your Lua library, making sure you define either
+OS_POSIX or OS_WINDOWS, depending on your platform.
+
+To save a bit of space, you can also define SHARE_LIOLIB if you're
+certain you are compiling lua-subprocess with the same toolchain as Lua
+was compiled with (in particular, `FILE*` pointers should be
+compatible). If you are not sure, don't use SHARE_LIOLIB, because it can
+cause crashing!
+
+.Example
+--------------------------
+gcc -fPIC -shared -DOS_POSIX -DLIOLIB_SHARE -o subprocess.so \
+    subprocess.c liolib-copy.c -llua
+--------------------------
+
 == Functions
 
 ==== subprocess.popen { arg1, arg2, ..., [options...] }
