@@ -1130,6 +1130,8 @@ static int call(lua_State *L)
     if (r != 1){
         return r;
     }
+    lua_replace(L, 1);
+    lua_settop(L, 1);
     return proc_wait(L);
 }
 
