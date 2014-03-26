@@ -19,6 +19,10 @@
  * THE SOFTWARE.
  */
 
+#ifdef OS_POSIX
+#define _POSIX_SOURCE
+#endif
+
 #if !defined(OS_WINDOWS) && !defined(OS_POSIX)
 #error None of these are defined: OS_WINDOWS, OS_POSIX
 #else
@@ -38,6 +42,7 @@
 #include "unistd.h"
 #include "sys/wait.h"
 #include "sys/stat.h"
+#include <stdio.h> // for fileno, fdopen
 typedef int filedes_t;
 
 /* return 1 if the named directory exists and is a directory */
@@ -1311,7 +1316,8 @@ LUALIB_API int luaopen_subprocess(lua_State *L)
     lua_rawseti(L, -2, SP_LIST);
     lua_replace(L, LUA_ENVIRONINDEX);
 
-    luaL_register(L, "subprocess", subprocess);
+    lua_createtable(L, 0, 5);
+    luaL_register(L, NULL, subprocess);
 
     /* export PIPE and STDOUT constants */
     lua_pushlightuserdata(L, &PIPE);
@@ -1323,8 +1329,7 @@ LUALIB_API int luaopen_subprocess(lua_State *L)
     luaL_newmetatable(L, SP_PROC_META);
     luaL_register(L, NULL, proc_meta);
     lua_pushboolean(L, 0);
-    lua_setfield(L, -2, "__metatable");
-    lua_pop(L, 1);
+    lua_setmetatable(L, -2);
 
     return 1;
 }
