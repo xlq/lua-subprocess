@@ -19,6 +19,10 @@
  * THE SOFTWARE.
  */
 
+#ifdef OS_POSIX
+#define _POSIX_SOURCE
+#endif
+
 #if !defined(OS_WINDOWS) && !defined(OS_POSIX)
 #error None of these are defined: OS_WINDOWS, OS_POSIX
 #else
@@ -38,6 +42,7 @@
 #include "unistd.h"
 #include "sys/wait.h"
 #include "sys/stat.h"
+#include "stdio.h"
 typedef int filedes_t;
 
 /* return 1 if the named directory exists and is a directory */
