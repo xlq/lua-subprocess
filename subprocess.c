@@ -106,7 +106,7 @@ struct proc {
    used for the `subprocess.wait` function.
    On POSIX, it is used to get the proc object corresponding to a pid. On
    Windows, it is used to assemble a HANDLE array for WaitForMultipleObjects. */
-#define SP_LIST 1
+#define SP_LIST "subprocess_pid_list"
 
 /* Function to count number of keys in a table.
    Table must be at top of stack. */
@@ -163,7 +163,7 @@ static void doneproc(lua_State *L, int index)
         /* remove proc from SP_LIST */
         lua_checkstack(L, 4);
         lua_pushvalue(L, index);    /* stack: proc */
-        lua_rawgeti(L, LUA_ENVIRONINDEX, SP_LIST);
+        luaL_getmetatable(L, SP_LIST);
         /* stack: proc list */
         if (lua_isnil(L, -1)){
             fputs("subprocess.c: XXX: SP_LIST IS NIL\n", stderr);
@@ -193,7 +193,7 @@ static int prune(lua_State *L)
 {
     int top = lua_gettop(L);
     lua_checkstack(L, 5);
-    lua_rawgeti(L, LUA_ENVIRONINDEX, SP_LIST);
+    luaL_getmetatable(L, SP_LIST);
     if (lua_isnil(L, -1)){
         lua_pop(L, 1);
         return 0;
@@ -901,7 +901,7 @@ files_failure:
     lua_pop(L, 1);
 
     /* Put proc object in SP_LIST table */
-    lua_rawgeti(L, LUA_ENVIRONINDEX, SP_LIST);
+    luaL_getmetatable(L, SP_LIST);
     if (lua_isnil(L, -1)){
         fputs("subprocess.c: XXX: SP_LIST IS NIL\n", stderr);
     } else {
@@ -1070,7 +1070,7 @@ static int proc_wait(lua_State *L)
 static int proc_send_signal(lua_State *L)
 {
     struct proc *proc = checkproc(L, 1);
-    int sig = luaL_checkint(L, 2);
+    int sig = luaL_checkinteger(L, 2);
     if (!proc->done){
         if (kill(proc->pid, sig)){
             return luaL_error(L, "kill: %s", strerror(errno));
@@ -1192,7 +1192,7 @@ static int superwait(lua_State *L)
     DWORD exitcode;
 #endif
 
-    lua_rawgeti(L, LUA_ENVIRONINDEX, SP_LIST);
+    luaL_getmetatable(L, SP_LIST);
     if (lua_isnil(L, -1))
         return luaL_error(L, "SP_LIST is nil");
 #if defined(OS_POSIX)
@@ -1311,12 +1311,17 @@ static const luaL_Reg subprocess[] = {
 LUALIB_API int luaopen_subprocess(lua_State *L)
 {
     /* create environment table for C functions */
-    lua_createtable(L, 1, 0);
-    lua_newtable(L);   /* table for all proc objects */
-    lua_rawseti(L, -2, SP_LIST);
-    lua_replace(L, LUA_ENVIRONINDEX);
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, LUA_REGISTRYINDEX, SP_LIST);
+    lua_pop(L, 1);
 
+#if LUA_VERSION_NUM >= 502
+    lua_createtable(L, 0, sizeof subprocess / sizeof *subprocess - 1);
+    luaL_setfuncs(L, subprocess, 0);
+#else
     luaL_register(L, "subprocess", subprocess);
+#endif
 
     /* export PIPE and STDOUT constants */
     lua_pushlightuserdata(L, &PIPE);
@@ -1326,7 +1331,11 @@ LUALIB_API int luaopen_subprocess(lua_State *L)
 
     /* create metatable for proc objects */
     luaL_newmetatable(L, SP_PROC_META);
+#if LUA_VERSION_NUM >= 502
+    luaL_setfuncs(L, proc_meta, 0);
+#else
     luaL_register(L, NULL, proc_meta);
+#endif
     lua_pushboolean(L, 0);
     lua_setfield(L, -2, "__metatable");
     lua_pop(L, 1);

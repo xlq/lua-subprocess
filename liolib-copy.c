@@ -93,8 +93,8 @@ static int f_lines(lua_State *L)
 
 static int read_number(lua_State *L, FILE *f)
 {
-    lua_Number d;
-    if (fscanf(f, LUA_NUMBER_SCAN, &d) == 1) {
+    double d;
+    if (fscanf(f, "%lf", &d) == 1) {
         lua_pushnumber(L, d);
         return 1;
     } else return 0;  /* read fails */
@@ -250,7 +250,7 @@ static int f_seek(lua_State *L)
     static const char *const modenames[] = {"set", "cur", "end", NULL};
     FILE *f = tofile(L);
     int op = luaL_checkoption(L, 2, "cur", modenames);
-    long offset = luaL_optlong(L, 3, 0);
+    long offset = luaL_optinteger(L, 3, 0);
     op = fseek(f, offset, mode[op]);
     if (op)
         return pushresult(L, 0, NULL);  /* error */
@@ -294,7 +294,11 @@ static void createmeta(lua_State *L)
     luaL_newmetatable(L, LUA_FILEHANDLE);  /* create metatable for file handles */
     lua_pushvalue(L, -1);  /* push metatable */
     lua_setfield(L, -2, "__index");  /* metatable.__index = metatable */
+#if LUA_VERSION_NUM >= 502
+    luaL_setfuncs(L, flib, 0);
+#else
     luaL_register(L, NULL, flib);  /* file methods */
+#endif
 }
 
 #else /* #ifndef SHARE_LIOLIB */
